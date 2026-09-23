@@ -6,272 +6,183 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.example.securevpn.security.SecureStorage
 import com.example.securevpn.ui.HomeScreen
-import com.example.securevpn.vpn.SecureVpnService
+import com.example.securevpn.ui.theme.AppThemeMode
+import com.example.securevpn.ui.theme.SecureVPNTheme
+import com.example.securevpn.vpn.VpnServers
+import com.example.securevpn.vpn.VpnServiceManager
 import com.example.securevpn.vpn.VpnState
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
 
+    private lateinit var vpnServiceManager: VpnServiceManager
+    private lateinit var secureStorage: SecureStorage
+
     private var killSwitchEnabled by mutableStateOf(false)
+    private var selectedServerId by mutableStateOf("singapore")
+    private var appThemeMode by mutableStateOf(AppThemeMode.SYSTEM)
 
-    /*
-     * VPN permission result
-     */
     private val vpnPermissionLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == RESULT_OK) {
-                startVpnService()
+                connectToSelectedServer()
             } else {
-                viewModel.setState(VpnState.ERROR)
+                Toast.makeText(this, "VPN permission was denied", Toast.LENGTH_SHORT).show()
             }
         }
 
-    /*
-     * Notification permission result
-     */
     private val notificationPermissionLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-
-            if (granted) {
-                connectVpn()
-            } else {
-                /*
-                 * Notification permission is useful for the
-                 * VPN foreground service.
-                 *
-                 * We still allow the VPN flow to continue,
-                 * but Android may limit the notification.
-                 */
-                connectVpn()
-            }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            requestVpnPermission()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        setContent {
+        secureStorage = SecureStorage(applicationContext)
 
+        // Restore theme mode preference
+        val storedTheme = secureStorage.get("app_theme_mode")
+        if (storedTheme != null) {
+            try {
+                appThemeMode = AppThemeMode.valueOf(storedTheme)
+            } catch (e: Exception) {
+                appThemeMode = AppThemeMode.SYSTEM
+            }
+        }
+
+        VpnServers.loadCustomServers(applicationContext)
+
+        if (VpnServers.servers.isNotEmpty()) {
+            selectedServerId = VpnServers.servers.first().id
+        }
+
+        vpnServiceManager = VpnServiceManager.getInstance(applicationContext)
+
+        setContent {
             val state by viewModel.vpnState.collectAsState()
 
-            MaterialTheme {
-
-                Surface {
-
-                    HomeScreen(
-                        state = state,
-
-                        killSwitchEnabled =
-                            killSwitchEnabled,
-
-                        onKillSwitchChanged = { enabled ->
-                            killSwitchEnabled = enabled
-                        },
-
-                        onConnect = {
-                            requestNotificationPermissionAndConnect()
-                        },
-
-                        onDisconnect = {
-                            disconnectVpn()
+            SecureVPNTheme(themeMode = appThemeMode) {
+                HomeScreen(
+                    state = state,
+                    themeMode = appThemeMode,
+                    onThemeModeChanged = { newTheme ->
+                        appThemeMode = newTheme
+                        secureStorage.save("app_theme_mode", newTheme.name)
+                    },
+                    killSwitchEnabled = killSwitchEnabled,
+                    onKillSwitchChanged = { enabled ->
+                        killSwitchEnabled = enabled
+                        if (enabled) {
+                            try {
+                                Toast.makeText(
+                                    this,
+                                    "Opening System VPN Settings. Enable 'Block connections without VPN' for Kill Switch.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                            } catch (e: Exception) {
+                                Toast.makeText(this, "Kill Switch active", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                    )
-                }
+                    },
+                    onServerSelected = { serverId ->
+                        selectedServerId = serverId
+                    },
+                    selectedServerId = selectedServerId,
+                    onConnect = {
+                        requestPermissionsAndConnect()
+                    },
+                    onDisconnect = {
+                        disconnectVpn()
+                    },
+                    onAddCustomConfig = { config ->
+                        VpnServers.saveServer(applicationContext, config)
+                        selectedServerId = config.id
+                        Toast.makeText(this, "Saved custom server ${config.name}", Toast.LENGTH_SHORT).show()
+                    }
+                )
             }
         }
     }
 
-    /**
-     * Request notification permission before starting
-     * the foreground VPN service.
-     */
-    private fun requestNotificationPermissionAndConnect() {
+    private fun requestPermissionsAndConnect() {
+        if (viewModel.vpnState.value == VpnState.CONNECTED || viewModel.vpnState.value == VpnState.CONNECTING) {
+            return
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-
-            val permission =
-                Manifest.permission.POST_NOTIFICATIONS
-
-            val granted =
-                ContextCompat.checkSelfPermission(
-                    this,
-                    permission
-                ) == PackageManager.PERMISSION_GRANTED
+            val permission = Manifest.permission.POST_NOTIFICATIONS
+            val granted = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
             if (!granted) {
-
-                notificationPermissionLauncher.launch(
-                    permission
-                )
-
+                notificationPermissionLauncher.launch(permission)
                 return
             }
         }
 
-        connectVpn()
+        requestVpnPermission()
     }
 
-    /**
-     * Start the Android VPN permission flow.
-     */
-    private fun connectVpn() {
-
-        /*
-         * Prevent multiple connection attempts.
-         */
-        if (
-            viewModel.vpnState.value ==
-            VpnState.CONNECTING ||
-            viewModel.vpnState.value ==
-            VpnState.CONNECTED
-        ) {
-            return
-        }
-
-        viewModel.setState(
-            VpnState.CONNECTING
-        )
-
-        val vpnPermissionIntent =
-            VpnService.prepare(this)
-
-        if (vpnPermissionIntent != null) {
-
-            /*
-             * Android will display the VPN permission
-             * confirmation screen.
-             */
-            vpnPermissionLauncher.launch(
-                vpnPermissionIntent
-            )
-
+    private fun requestVpnPermission() {
+        val prepareIntent = VpnService.prepare(this)
+        if (prepareIntent != null) {
+            vpnPermissionLauncher.launch(prepareIntent)
         } else {
-
-            /*
-             * VPN permission was already granted.
-             */
-            startVpnService()
+            connectToSelectedServer()
         }
     }
 
-    /**
-     * Start SecureVpnService.
-     */
-    private fun startVpnService() {
+    private fun connectToSelectedServer() {
+        val server = VpnServers.servers.firstOrNull { it.id == selectedServerId }
 
-        try {
-
-            val intent =
-                Intent(
-                    this,
-                    SecureVpnService::class.java
-                ).apply {
-                    action =
-                        SecureVpnService.ACTION_CONNECT
-                }
-
-            ContextCompat.startForegroundService(
-                this,
-                intent
-            )
-
-            /*
-             * IMPORTANT:
-             *
-             * Do NOT immediately set CONNECTED here.
-             *
-             * The service still needs to create the VPN
-             * interface and eventually establish the real
-             * WireGuard tunnel.
-             *
-             * For now we keep CONNECTING.
-             *
-             * Later SecureVpnService will report:
-             *
-             * CONNECTING -> CONNECTED
-             *
-             * only after the actual tunnel is ready.
-             */
-
-        } catch (exception: Exception) {
-
-            viewModel.setState(
-                VpnState.ERROR
-            )
-        }
-    }
-
-    /**
-     * Stop the VPN service.
-     */
-    private fun disconnectVpn() {
-
-        /*
-         * Nothing to disconnect.
-         */
-        if (
-            viewModel.vpnState.value ==
-            VpnState.DISCONNECTED
-        ) {
+        if (server == null) {
+            Toast.makeText(this, "VPN server profile not found", Toast.LENGTH_SHORT).show()
             return
         }
 
-        viewModel.setState(
-            VpnState.DISCONNECTING
-        )
-
-        try {
-
-            val intent =
-                Intent(
-                    this,
-                    SecureVpnService::class.java
-                ).apply {
-                    action =
-                        SecureVpnService.ACTION_DISCONNECT
-                }
-
-            startService(intent)
-
-            viewModel.setState(
-                VpnState.DISCONNECTED
-            )
-
-        } catch (exception: Exception) {
-
-            viewModel.setState(
-                VpnState.ERROR
-            )
+        lifecycleScope.launch {
+            val result = vpnServiceManager.connect(server)
+            result.onFailure { exception ->
+                Toast.makeText(
+                    this@MainActivity,
+                    exception.message ?: "VPN connection failed",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
     }
 
-    override fun onDestroy() {
+    private fun disconnectVpn() {
+        if (viewModel.vpnState.value == VpnState.DISCONNECTED) {
+            return
+        }
 
-        /*
-         * We intentionally do not automatically
-         * disconnect the VPN when the Activity closes.
-         *
-         * The VPN service can continue running in
-         * the background.
-         */
-
-        super.onDestroy()
+        lifecycleScope.launch {
+            val result = vpnServiceManager.disconnect()
+            result.onFailure { exception ->
+                Toast.makeText(
+                    this@MainActivity,
+                    exception.message ?: "VPN disconnect failed",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 }

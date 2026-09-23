@@ -1,6 +1,5 @@
 package com.example.securevpn.vpn
 
-
 enum class VpnState {
 
     DISCONNECTED,
